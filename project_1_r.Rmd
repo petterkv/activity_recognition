@@ -1,0 +1,273 @@
+Libraries
+```{r}
+library(data.table)
+library(ggplot2)
+library(randomForest)
+library(anytime) #Load library for date conversion
+library(reshape2)
+library(lattice)
+library(ggvis)
+library(rpart)
+library(rpart.plot)
+library(C50)
+library(corrplot)
+library(xgboost)
+library(magrittr)
+library(dplyr)
+library(DataExplorer)
+library(Matrix)
+library(caret)
+library(Metrics)
+library(readr)
+library(stringr)
+library(car)
+library(mlbench)
+library(tidyverse)
+library(ggstatsplot)
+
+
+```
+
+Import raw dataset
+```{r}
+setwd("C:/Users/johnpk/OneDrive/NTNU old/Maskinlæring/HIOF ML prosjekter")
+ios_act_raw <- data.table(read.csv("ios_act.csv")) #Read data from file into a data table`
+```
+
+Prepare dataset
+```{r}
+ios_act<-ios_act_raw[,-c(1:4,12,13,17,21,25:47,49, 50:54)] #Remove columns with the sum of zero,time,std = zero
+```
+----------------------------------------------------
+Data exploration
+----------------------------------------------------
+Statistics about the dataset
+```{r}
+str(ios_act_raw)
+dim(ios_act_raw) #The number of rows and columns
+colnames(ios_act_raw) #The column names
+summary(ios_act_raw) #Some descriptive statistics about the raw dataset
+summary(ios_act) #Some descriptive statistics about the dataset
+attributes(ios_act_raw) #The column names and the row names (Rownames are numerical in this example)
+duplicated(ios_act_raw) #Check for duplicate names
+sum(is.na(ios_act_raw)) #Check for missing values
+ios_act_raw[, colSums(ios_act_raw != 0)>0] #Check for columns where all values like zero
+plot_missing(ios_act_raw)
+plot_bar(ios_act_raw)
+plot_histogram(ios_act_raw)
+plot_histogram(ios_act)
+plot_correlation(ios_act)
+ggplot(data=ios_act)
+boxplot(ios_act$activity~ios_act$locationLatitude, data=ios_act, horizontal=T)
+boxplot(ios_act$locationLongitude, data=ios_act, horizontal=T)
+boxplot(ios_act$locationAltitude,horizontal=T)
+boxplot(ios_act$locationSpeed,horizontal=T)
+boxplot(ios_act$locationCourse,horizontal=T)
+boxplot(ios_act$locationVerticalAccuracy,horizontal=T, main="Location Vertical Accuracy")
+boxplot(ios_act$locationHorizontalAccuracy,horizontal=T)
+boxplot(ios_act$accelerometerAccelerationX,horizontal=T)
+boxplot(ios_act$accelerometerAccelerationY,horizontal=T)
+boxplot(ios_act$accelerometerAccelerationZ,horizontal=T)
+boxplot(ios_act$gyroRotationX,horizontal=T)
+boxplot(ios_act$gyroRotationY,horizontal=T)
+boxplot(ios_act$gyroRotationZ,horizontal=T)
+boxplot(ios_act$magnetometerX,horizontal=T)
+boxplot(ios_act$magnetometerY,horizontal=T)
+boxplot(ios_act$magnetometerZ,horizontal=T)
+
+ggbetweenstats(data = ios_act, outlier.tagging = TRUE, outlier.label = name)
+
+sapply(ios_act, class)
+```
+
+Distribution of the individual predictors
+```{r}
+ios_act.mlt <- data.table::melt(ios_act_raw, id.vars="activity", measure.vars = c(1:16)) #Transform the columns into key and values
+densityplot(~value|variable,data = ios_act.mlt, scales = list(x = list(relation = "free"), y = list(relation = "free")),adjust = 1.25, pch = "|", xlab = "Predictor")
+
+```
+
+Correlation between the predictors
+```{r}
+res=cor(ios_act.pred) #Compute a correlation matrix
+corrplot(res, type="upper", order="hclust", tl.col = "black", tl.srt=45)
+```
+--------------------------------------------------------------------
+                    Create training and test set
+--------------------------------------------------------------------
+
+Create training and test set
+```{r}
+#Randomize the observations
+ios_act.pred<-ios_act[,-c(17)] #A dataset with only the predictors
+smp_size<-floor(0.8*nrow(ios_act)) #Sett sample size to 80% of the observations
+set.seed(123)
+ios_act_ind<-sample(seq_len(nrow(ios_act)),size=smp_size) #Create a randmoized dataset
+ios_act.train<-ios_act[ios_act_ind,] #Training dataset (80%)
+ios_act.test<-ios_act[-ios_act_ind,] #Test dataset (20%)
+
+ios_act.train.pred<-ios_act.train[,-c(17)] #A training dataset with only the predictors
+ios_act.train.target<-ios_act.train[,c(17)] #A training dataset with only the target variable
+ios_act.test.pred<-ios_act.test[,-c(17)] #A test dataset with only the predictors
+ios_act.test.target<-ios_act.test[,c(17)] #A test dataset with only the target variable
+
+#Numeric target variables
+ios_act.train.targetnum <- as.numeric(ios_act.train$activity)
+ios_act.test.targetnum <- as.numeric(ios_act.test$activity)
+
+# Target variables for XGBoost. All values are reduced by one
+ios_act.train.xgbtarget <- as.numeric(ios_act.train$activity)-1
+ios_act.test.xgbtarget <- as.numeric(ios_act.test$activity)-1
+
+# Predictors in a  matrix for XGBoost. + 0 means that the model will not have an intercept
+ios_act.train.xgbmatrixpred <- model.matrix(~ . + 0, data = ios_act.train[, -c(17)])
+ios_act.test.xgbmatrixpred <- model.matrix(~ . + 0, data = ios_act.test[, -c(17)])
+
+# Convert predictors into a DMatrix object
+ios_act.train.xgbobjectpred <- xgb.DMatrix(data = ios_act.train.xgbmatrixpred, label = ios_act.train.xgbtarget)
+
+numberOfClasses <- length(unique(ios_act$activity))
+
+```
+
+----------------------------------------------------------------------------------
+                            Pre-process data
+----------------------------------------------------------------------------------
+General
+```{r}
+ios_act$activity<-factor(ios_act$activity)
+```
+
+For C5.0
+```{r}
+ios_act.train.target$activity<-factor(ios_act.train.target$activity) 
+```
+
+For Random Forest
+```{r}
+preprPredictors = preProcess(ios_act.train.pred, method=c("BoxCox", "center", "scale")) #Preprosess the original predictors
+transformedPredTrain <- predict(preprPredictors, ios_act.train.pred)
+```
+
+----------------------------------------------------------------------------------
+                                     C5.0
+----------------------------------------------------------------------------------
+```{r}
+mC5.0 <- C5.0(ios_act.train.pred, ios_act.train.target$activity, rules = TRUE)
+summary(mC5.0) #Review the output of the model
+mpC5.0<-predict(mC5.0, ios_act.test) #Run the prediction
+table(ios_act.test$activity, mpC5.0) #Create a confusion matrix
+```
+
+----------------------------------------------------------------------------------
+                                Random forrest
+----------------------------------------------------------------------------------
+```{r}
+(Standard values mtry=4 and number of trees = 500)
+mRF<-randomForest(ios_act.train.pred, ios_act.train.target$activity, importance = TRUE, na.action = na.omit)
+mRF$confusion
+summary(mRF)
+print(mRF)
+attributes(mRF) #Show the attributes of the model
+mpRF<-predict(mRF, ios_act.test)
+attributes(mpRF)
+table(ios_act.test$activity, mpRF)
+
+mRF_1<-randomForest(transformedPredTrain, as.factor(ios_act.train.target$activity), importance = TRUE, na.action = na.omit)
+mRF_1$confusion #Confusing matrix for the modelsummary(m3.1)
+print(mRF_1)
+attributes(mRF_1) #Show the attributes of the model
+mpRF_1<-predict(mRF_1, ios_act.test.pca)
+table(ios_act.test$activity, mpRF_1)
+```
+
+----------------------------------------------------------------------------------
+                                    XGBoost
+----------------------------------------------------------------------------------
+
+Hyperparameters for Cross Validation
+```{r}
+cvxgbhyperparams <- list(booster = "gbtree", objective = "multi:softprob", num_class = 5, eval_metric = "mlogloss")
+```
+
+Run cross validation to imitigate overfitting. Finding the best nround value and estimate the test error
+```{r}
+xgbcv <- xgb.cv(params = cvxgbhyperparams, data = ios_act.train.xgbobjectpred, nrounds = 200, nfold = 5, showsd = TRUE, stratified = TRUE, print_every_n = 10, early_stop_round = 20, maximize = FALSE, prediction = TRUE)
+
+```
+
+Function to compute the confusion matrix
+```{r}
+# Function to compute classification error
+classification_error <- function(conf_mat) {
+  conf_mat = as.matrix(conf_mat)
+  
+  error = 1 - sum(diag(conf_mat)) / sum(conf_mat)
+  
+  return (error)
+}
+```
+
+
+Evaluate the cross validation
+```{r}
+# Mutate xgb output to deliver hard predictions
+xgb_train_preds <- data.frame(xgbcv$pred) %>% mutate(max = max.col(., ties.method = "last"), label = ios_act.train.xgbtarget + 1)
+
+# Examine output
+head(xgb_train_preds)
+
+# Confustion Matrix
+xgb_conf_mat <- table(true = ios_act.train.xgbtarget + 1, pred = xgb_train_preds$max)
+
+# Error 
+cat("XGB Training Classification Error Rate:", classification_error(xgb_conf_mat), "\n")
+
+xgb_conf_mat_2 <- confusionMatrix(factor(xgb_train_preds$label),
+                                  factor(xgb_train_preds$max),
+                                  mode = "everything")
+
+print(xgb_conf_mat_2)
+
+#Log loss, short for logarithmic loss is a loss function for classification that quantifies the price paid for the inaccuracy of predictions in classification problems. Log loss penalizes false classifications by taking into account the probability of classification.
+min_logloss = min(xgbcv$evaluation_log[,c(test_mlogloss_mean)])
+min_logloss_index = which.min(xgbcv$evaluation_log[,c(test_mlogloss_mean)]) #Find the index
+
+   
+```
+
+Hyperparameters for the model
+```{r}
+xgbhyperparams <- list(booster = "gbtree", objective = "multi:softprob", "num_class" = 5, "eval_metric" = "mlogloss")
+```
+
+Build the model
+```{r}
+xgbmodel <- xgb.train (params = xgbhyperparams, data = ios_act.train.xgbobjectpred, nrounds = 200)
+
+```
+
+Run the prediction
+```{r}
+xgb_prediction <- predict(xgbmodel, newdata = ios_act.test.xgbmatrixpred)
+```
+
+Evaluate the model
+```{r}
+test_prediction <- matrix(xgb_prediction, nrow = numberOfClasses,
+                          ncol=length(xgb_prediction)/numberOfClasses) %>%
+  t() %>%
+  data.frame() %>%
+  mutate(label = ios_act.test.xgbtarget + 1,
+         max_prob = max.col(., "last"))
+
+# confusion matrix of test set
+confusionMatrix(factor(test_prediction$max_prob),
+                factor(test_prediction$label),
+                mode = "everything")
+```
+
+
+
+```
+
