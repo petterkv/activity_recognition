@@ -17,21 +17,28 @@ library(dplyr)
 library(DataExplorer)
 library(Matrix)
 library(caret)
+library(xgboost)
 library(Metrics)
 library(readr)
 library(stringr)
 library(car)
+library(multiROC)
 library(mlbench)
 library(tidyverse)
+library(devtools)
 library(ggstatsplot)
-
+library(ROCR)
+library(OneR)
+library(caTools)
+library(mlr)
+library(pROC)
 
 ```
 
 Import raw dataset
 ```{r}
 setwd("C:/Users/johnpk/OneDrive/NTNU old/Maskinlæring/HIOF ML prosjekter")
-ios_act_raw <- data.table(read.csv("ios_act.csv")) #Read data from file into a data table`
+ios_act_raw <- data.table(read.csv("ios_act_test.csv")) #Read data from file into a data table`
 ```
 
 Prepare dataset
@@ -57,6 +64,7 @@ plot_bar(ios_act_raw)
 plot_histogram(ios_act_raw)
 plot_histogram(ios_act)
 plot_correlation(ios_act)
+numberOfClasses <- length(unique(ios_act$activity))
 ggplot(data=ios_act)
 boxplot(ios_act$activity~ios_act$locationLatitude, data=ios_act, horizontal=T)
 boxplot(ios_act$locationLongitude, data=ios_act, horizontal=T)
@@ -115,19 +123,6 @@ ios_act.test.target<-ios_act.test[,c(17)] #A test dataset with only the target v
 ios_act.train.targetnum <- as.numeric(ios_act.train$activity)
 ios_act.test.targetnum <- as.numeric(ios_act.test$activity)
 
-# Target variables for XGBoost. All values are reduced by one
-ios_act.train.xgbtarget <- as.numeric(ios_act.train$activity)-1
-ios_act.test.xgbtarget <- as.numeric(ios_act.test$activity)-1
-
-# Predictors in a  matrix for XGBoost. + 0 means that the model will not have an intercept
-ios_act.train.xgbmatrixpred <- model.matrix(~ . + 0, data = ios_act.train[, -c(17)])
-ios_act.test.xgbmatrixpred <- model.matrix(~ . + 0, data = ios_act.test[, -c(17)])
-
-# Convert predictors into a DMatrix object
-ios_act.train.xgbobjectpred <- xgb.DMatrix(data = ios_act.train.xgbmatrixpred, label = ios_act.train.xgbtarget)
-
-numberOfClasses <- length(unique(ios_act$activity))
-
 ```
 
 ----------------------------------------------------------------------------------
@@ -135,52 +130,260 @@ numberOfClasses <- length(unique(ios_act$activity))
 ----------------------------------------------------------------------------------
 General
 ```{r}
-ios_act$activity<-factor(ios_act$activity)
+ios_act$activity<-factor(ios_act$activity) 
+```
+
+Dimension reduction
+```{r}
+ios_act.train.pca <- prcomp(ios_act.train.pred, center=TRUE, scale. = TRUE)
+summary(ios_act.train.pca)
 ```
 
 For C5.0
 ```{r}
-ios_act.train.target$activity<-factor(ios_act.train.target$activity) 
+ios_act.train.target$activity<-factor(ios_act.train.target$activity)
+
+pred_centered_scaled <- preProcess(ios_act.train.pred, method=c("center", "scale"))
+ios_act.train.pred_centsca <- predict(pred_centered_scaled, ios_act.train.pred) 
+
+pred_centered_scaled_test <- preProcess(ios_act.test.pred, method=c("center", "scale"))
+ios_act.test.pred_centsca <- predict(pred_centered_scaled_test, ios_act.test.pred) 
+
+pcacomp = preProcess(ios_act.train.pred, method=c("BoxCox", "center", "scale", "pca"))  #Preprosess predictors and generate PCA
+transformedPredPCATrain <- predict(pcacomp, ios_act.train.pred) 
+
+#ethod=c("BoxCox", "center", "scale", "pca"))
+pcacompTst = preProcess(ios_act.test.pred, method=c("BoxCox", "center", "scale", "pca"))  #Preprosess predictors and generate
+transformedPredPCATest<-predict(pcacompTst, ios_act.test.pred) 
 ```
 
 For Random Forest
 ```{r}
-preprPredictors = preProcess(ios_act.train.pred, method=c("BoxCox", "center", "scale")) #Preprosess the original predictors
+preprPredictors = preProcess(ios_act.train.pred, method=c("BoxCox", "center", "scale","pca")) #Preprosess the original predictors
 transformedPredTrain <- predict(preprPredictors, ios_act.train.pred)
 ```
+
+For XGBoost
+```{r}
+
+#One hot encoding
+new_train_pred <- model.matrix(~.+0,data = ios_act.train[,-c("activity"),with=F])
+new_test_pred <- model.matrix(~.+0,data = ios_act.test[,-c("activity"),with=F])
+
+trainTarget <- as.numeric(as.factor(ios_act.train$activity))-1
+testTarget <- as.numeric(as.factor(ios_act.test$activity))-1
+
+# Convert into a DMatrix object
+dtrain <- xgb.DMatrix(data = new_train_pred,label = trainTarget) 
+dtest <- xgb.DMatrix(data = new_test_pred,label= testTarget)
+
+cvxgbhyperparams <- list(booster = "gbtree", objective = "multi:softmax", num_class = 5)
+
+xgbcv <- xgb.cv( params = cvxgbhyperparams, data = dtrain, nrounds = 100, nfold = 5, showsd = T, stratified = T, print.every.n = 10, early.stop.round = 20, maximize = F)
+
+
+```
+
+
 
 ----------------------------------------------------------------------------------
                                      C5.0
 ----------------------------------------------------------------------------------
+Train
 ```{r}
+#Rule based
 mC5.0 <- C5.0(ios_act.train.pred, ios_act.train.target$activity, rules = TRUE)
 summary(mC5.0) #Review the output of the model
-mpC5.0<-predict(mC5.0, ios_act.test) #Run the prediction
-table(ios_act.test$activity, mpC5.0) #Create a confusion matrix
+
+#Tree based
+m_1C5.0 <- C5.0(ios_act.train.pred, ios_act.train.target$activity, rules = FALSE)
+summary(m_1C5.0) #Review the output of the model
+
+#Tree based with pre-processeding (center, scaled, BoxCox, PCA
+m_2C5.0 <- C5.0(ios_act.train.pred_centsca, ios_act.train.target$activity, rules = TRUE)
+summary(m_2C5.0) #Review the output of the model
+
+#Calculate costs of misclassification
+cost_mat <- matrix(c(
+  0,1,3,5,5,
+  1,0,3,5,5,
+  3,3,0,1,3,
+  3,3,1,0,3,
+  3,3,5,5,0
+  ),5,5)
+
+rownames(cost_mat) <- colnames(cost_mat) <- c("1","2","4","8","32")
+cost_mat
+
+m_3C5.0 <- C5.0(ios_act.train.pred, as.factor(ios_act.train.target$activity), trials=10, costs=cost_mat)
+summary(m_3C5.0) #Review the output of the model
+
+m_4C5.0 <- C5.0(ios_act.train.pred, as.factor(ios_act.train.target$activity), trials=10, control = C5.0Control(winnow = TRUE))
+summary(m_4C5.0)
 ```
 
+Predict
+```{r}
+mpC5.0<-predict(mC5.0, ios_act.test) #Run the prediction
+mpC5.0prob<-predict(mC5.0, ios_act.test, type="prob") #Run the prediction
+
+m_1pC5.0<-predict(m_1C5.0, ios_act.test) #Run the prediction
+m_1pC5.0prob<-predict(m_1C5.0, ios_act.test, type="prob") #Run the prediction
+
+m_2pC5.0<-predict(m_2C5.0, ios_act.test.pred_centsca) #Run the prediction
+
+m_3pC5.0<-predict(m_3C5.0, ios_act.test) #Run the prediction
+
+m_4pC5.0<-predict(m_4C5.0, ios_act.test) #Run the prediction
+
+```
+
+Evaluate
+```{r}
+confMatrixC5.0 <- confusionMatrix(table(mpC5.0, ios_act.test$activity),mode="everything")
+tablempC5.0 <- confMatrixC5.0$table
+accuracyC5.0 <- confMatrixC5.0$overall["Accuracy"]
+kappaC5.0 <- confMatrixC5.0$overall["Kappa"]
+F1C5.0 <- mean(confMatrixC5.0[["byClass"]][, "F1"])
+ROCmpC5.0 <- multiclass.roc(response = ios_act.test$activity, predictor = predict(mC5.0, ios_act.test, type="prob"))
+
+confMatrixC5.0_1 <- confusionMatrix(table(m_1pC5.0, ios_act.test$activity),mode="everything")
+tablempC5.0_1 <- confMatrixC5.0_1$table
+accuracyC5.0_1 <- confMatrixC5.0_1$overall["Accuracy"]
+kappaC5.0_1 <- confMatrixC5.0_1$overall["Kappa"]
+F1C5.0_1 <- mean(confMatrixC5.0_1[["byClass"]][, "F1"])
+ROCmpC5.0_1 <- multiclass.roc(response = ios_act.test$activity, predictor = predict(m_1C5.0, ios_act.test, type="prob"))
+
+confMatrixC5.0_2 <- confusionMatrix(table(m_2pC5.0, ios_act.test$activity),mode="everything")
+tablempC5.0_2 <- confMatrixC5.0_2$table
+accuracyC5.0_2 <- confMatrixC5.0_2$overall["Accuracy"]
+kappaC5.0_2 <- confMatrixC5.0_2$overall["Kappa"]
+F1C5.0_2 <- mean(confMatrixC5.0_2[["byClass"]][, "F1"])
+ROCmpC5.0_2 <- multiclass.roc(response = ios_act.test$activity, predictor = predict(m_3C5.0, ios_act.test, type="prob"))
+
+confMatrixC5.0_3 <- confusionMatrix(table(m_3pC5.0, ios_act.test$activity),mode="everything")
+tablempC5.0_3 <- confMatrixC5.0_3$table
+accuracyC5.0_3 <- confMatrixC5.0_3$overall["Accuracy"]
+kappaC5.0_3 <- confMatrixC5.0_3$overall["Kappa"]
+F1C5.0_3 <- mean(confMatrixC5.0_3[["byClass"]][, "F1"])
+ROCmpC5.0_3 <- multiclass.roc(response = ios_act.test$activity, predictor = predict(m_2C5.0, ios_act.test, type="prob"))
+
+confMatrixC5.0_4 <- confusionMatrix(table(m_4pC5.0, ios_act.test$activity),mode="everything")
+tablempC5.0_4 <- confMatrixC5.0_4$table
+accuracyC5.0_4 <- confMatrixC5.0_4$overall["Accuracy"]
+kappaC5.0_4 <- confMatrixC5.0_4$overall["Kappa"]
+F1C5.0_4 <- mean(confMatrixC5.0_4[["byClass"]][, "F1"])
+ROCmpC5.0_4 <- multiclass.roc(response = ios_act.test$activity, predictor = predict(m_4C5.0, ios_act.test, type="prob"))
+
+res <- multiclass.roc(response = ios_act.test$activity, predictor = predict(mC5.0, ios_act.test, type="prob"), force_diag=T)
+
+plot(ROCmpC5.0$rocs)
+plot(ROCmpC5.0, ylim=c(0,1), print.thres=TRUE, main=paste('AUC:',round(ROCmpC5.0$auc[[1]],4)))
+abline(h=1,col='blue',lwd=2)
+abline(h=0,col='red',lwd=2) 
+
+n_method <- length(unique(res$Methods))
+n_group <- length(unique(res$Groups))
+res_df <- data.frame(Specificity= numeric(0), Sensitivity= numeric(0), Group = character(0), AUC = numeric(0), Method = character(0))
+for (i in 1:n_method) {
+      for (j in 1:n_group) {
+        temp_data_1 <- data.frame(Specificity=res$Specificity[[i]][j],
+                                  Sensitivity=res$Sensitivity[[i]][j],
+                                  Group=unique(res$Groups)[j],
+                                  AUC=res$AUC[[i]][j],
+                                  Method = unique(res$Methods)[i])
+        colnames(temp_data_1) <- c("Specificity", "Sensitivity", "Group", "AUC", "Method")
+        res_df <- rbind(res_df, temp_data_1)
+
+      }
+      temp_data_2 <- data.frame(Specificity=res$Specificity[[i]][n_group+1],
+                                Sensitivity=res$Sensitivity[[i]][n_group+1],
+                                Group= "Macro",
+                                AUC=res$AUC[[i]][n_group+1],
+                                Method = unique(res$Methods)[i])
+      temp_data_3 <- data.frame(Specificity=res$Specificity[[i]][n_group+2],
+                                Sensitivity=res$Sensitivity[[i]][n_group+2],
+                                Group= "Micro",
+                                AUC=res$AUC[[i]][n_group+2],
+                                Method = unique(res$Methods)[i])
+      colnames(temp_data_2) <- c("Specificity", "Sensitivity", "Group", "AUC", "Method")
+      colnames(temp_data_3) <- c("Specificity", "Sensitivity", "Group", "AUC", "Method")
+      res_df <- rbind(res_df, temp_data_2)
+      res_df <- rbind(res_df, temp_data_3)
+    }
+
+
+
+```
 ----------------------------------------------------------------------------------
                                 Random forrest
 ----------------------------------------------------------------------------------
+Train
 ```{r}
-(Standard values mtry=4 and number of trees = 500)
-mRF<-randomForest(ios_act.train.pred, ios_act.train.target$activity, importance = TRUE, na.action = na.omit)
+#(Standard values mtry=4 and number of trees = 500)
+mRF<-randomForest(ios_act.train.pred, as.factor(ios_act.train.target$activity), importance = TRUE, na.action = na.omit)
 mRF$confusion
 summary(mRF)
 print(mRF)
 attributes(mRF) #Show the attributes of the model
-mpRF<-predict(mRF, ios_act.test)
-attributes(mpRF)
+
 table(ios_act.test$activity, mpRF)
 
-mRF_1<-randomForest(transformedPredTrain, as.factor(ios_act.train.target$activity), importance = TRUE, na.action = na.omit)
+#5 Repeats of 10 fold cross validation
+tr <- trainControl(method = "cv", number = 5)
+caret::train(y=as.factor(ios_act.train.target$activity), x=ios_act.train.pred, method="rf", trControl= tr)
+
+m_1RF1<-randomForest(ios_act.train.pred, as.factor(ios_act.train.target$activity), mtry=10, importance = TRUE, na.action = na.omit)
+m_1RF$confusion
+
+#mtry changed after cross validation
+mRF_1<-randomForest(ios_act.train.pred, as.factor(ios_act.train.target$activity), importance = TRUE, na.action = na.omit, mtry=9)
 mRF_1$confusion #Confusing matrix for the modelsummary(m3.1)
+summary(mRF_1)
 print(mRF_1)
 attributes(mRF_1) #Show the attributes of the model
-mpRF_1<-predict(mRF_1, ios_act.test.pca)
-table(ios_act.test$activity, mpRF_1)
+
+
+
+
+
+```
+ 
+Predict
+```{r}
+mpRF<-predict(mRF, ios_act.test, type = "response")
+attributes(mpRF)
+
+mpRF_1<-predict(mRF_1, ios_act.test, type = "response")
+attributes(mpRF_1)
+
+#m_2pC5.0<-predict(m_2C5.0, ios_act.test.pred_centsca) #Run the prediction
+
 ```
 
+Evaluate
+```{r}
+confMatrixRF <- confusionMatrix(table(mpRF, ios_act.test$activity))
+
+table(ios_act.test$activity, mpRF_1)
+
+accuracyRF <- confMatrixRF$overall["Accuracy"]
+kappaRF <- confMatrixRF$overall["Kappa"]
+F1RF <- mean(confMatrixRF[["byClass"]][, "F1"])
+ROCmpRF <- multiclass.roc(response = ios_act.test$activity, predictor = predict(mRF, ios_act.test, type="prob"))
+
+confMatrixRF_1 <- confusionMatrix(table(mpRF_1, ios_act.test$activity))
+
+table(ios_act.test$activity, mpRF_1)
+
+accuracyRF <- confMatrixRF_1$overall["Accuracy"]
+kappaRF <- confMatrixRF_1$overall["Kappa"]
+F1RF <- mean(confMatrixRF_1[["byClass"]][, "F1"])
+ROCmpRF <- multiclass.roc(response = ios_act.test$activity, predictor = predict(mRF_1, ios_act.test, type="prob"))
+
+
+```
+ 
 ----------------------------------------------------------------------------------
                                     XGBoost
 ----------------------------------------------------------------------------------
@@ -192,7 +395,10 @@ cvxgbhyperparams <- list(booster = "gbtree", objective = "multi:softprob", num_c
 
 Run cross validation to imitigate overfitting. Finding the best nround value and estimate the test error
 ```{r}
-xgbcv <- xgb.cv(params = cvxgbhyperparams, data = ios_act.train.xgbobjectpred, nrounds = 200, nfold = 5, showsd = TRUE, stratified = TRUE, print_every_n = 10, early_stop_round = 20, maximize = FALSE, prediction = TRUE)
+
+xgbcv <- xgb.cv( params = cvxgbhyperparams, data = dtrain, nrounds = 100, nfold = 5, showsd = T, stratified = T, print.every.n = 10, early.stop.round = 20, maximize = F)
+
+min(xgbcv$test.error.mean)
 
 ```
 
@@ -239,35 +445,59 @@ min_logloss_index = which.min(xgbcv$evaluation_log[,c(test_mlogloss_mean)]) #Fin
 Hyperparameters for the model
 ```{r}
 xgbhyperparams <- list(booster = "gbtree", objective = "multi:softprob", "num_class" = 5, "eval_metric" = "mlogloss")
+xgbhyperparams <- list(booster = "gbtree", objective = "multi:softprob", "num_class" = 4, "eval_metric" = "mlogloss") #Second dataset
+xgbhyperparamsROC <- list(booster = "gbtree", objective = "multi:softmax", "num_class" = 5, "eval_metric" = "mlogloss")
+xgbhyperparamsROC <- list(booster = "gbtree", objective = "multi:softmax", "num_class" = 4, "eval_metric" = "mlogloss")
 ```
 
 Build the model
 ```{r}
-xgbmodel <- xgb.train (params = xgbhyperparams, data = ios_act.train.xgbobjectpred, nrounds = 200)
+#nrounds from xgb.cv
+mXGB <- xgb.train (params = xgbhyperparams, data = dtrain, nrounds = 96)
+mXGBROC <- xgb.train (params = xgbhyperparamsROC, data = dtrain, nrounds = 96)
 
 ```
 
 Run the prediction
 ```{r}
-xgb_prediction <- predict(xgbmodel, newdata = ios_act.test.xgbmatrixpred)
+mpXGB <- predict(mXGB, newdata = dtest)
+mpXGBROC <- predict(mXGBROC, newdata = dtest)
+
 ```
 
 Evaluate the model
 ```{r}
-test_prediction <- matrix(xgb_prediction, nrow = numberOfClasses,
-                          ncol=length(xgb_prediction)/numberOfClasses) %>%
+test_prediction <- matrix(mpXGB, nrow = numberOfClasses,
+                          ncol=length(mpXGB)/numberOfClasses) %>%
   t() %>%
   data.frame() %>%
-  mutate(label = ios_act.test.xgbtarget + 1,
+  mutate(label = testTarget + 1,
          max_prob = max.col(., "last"))
 
+
+
 # confusion matrix of test set
-confusionMatrix(factor(test_prediction$max_prob),
+xgbConfMatrix <- confusionMatrix(factor(test_prediction$max_prob),
                 factor(test_prediction$label),
                 mode = "everything")
+
+accuracyXGB <- xgbConfMatrix$overall["Accuracy"]
+kappaXGB <- xgbConfMatrix$overall["Kappa"]
+F1XGB <- mean(xgbConfMatrix[["byClass"]][, "F1"])
+
+
+ROCmpXGB <- multiclass.roc(response = testTarget, mpXGBROC)
+
+
+
+
+
 ```
 
+-------------------------------------------------------------------------------
+                           Functions
+-------------------------------------------------------------------------------
+```{r}
 
 
 ```
-
